@@ -1,0 +1,719 @@
+openapi: 3.1.0
+info:
+  title: Roame Public API
+  version: 1.0.0
+  summary: Критичний сценарій «запит → оптимізація → підтвердження маршруту → бронювання».
+  description: |
+    Контракт між контейнерами React SPA → Reverse Proxy → API Gateway (FastAPI)
+    та сервісами-власниками Recommendation Service і Booking Service (C4, рівень 2,
+    зв'язки C2а-05, C2а-09, C2а-10).
+
+    Автентифікація: JWT access-токен (ES256, 15 хв) у cookie `__Host-access`
+    (SRS-NFR-SEC-01, SEC-04). Змінювальні методи додатково вимагають заголовок
+    `X-CSRF-Token` (double-submit) і перевірку `Origin` / `Sec-Fetch-Site`.
+
+    Формат помилок: RFC 9457 `application/problem+json` з полем `code`.
+    Час: ISO 8601 / RFC 3339, UTC (`date-time`) або календарна дата (`date`).
+    Гроші: рядок-десятковий з двома знаками після коми + код валюти ISO 4217.
+  contact:
+    name: Касяненко Анастасія Андріївна
+servers:
+  - url: https://localhost/v1
+    description: Стенд Docker Compose (Reverse Proxy, TLS 1.3)
+tags:
+  - name: Trip requests
+    description: Recommendation Service — інтерпретація наміру та відбір кандидатів
+  - name: Optimization jobs
+    description: Recommendation Service — асинхронні задачі CP-SAT
+  - name: Itineraries
+    description: Booking Service — маршрут і його підтвердження
+  - name: Bookings
+    description: Booking Service — життєвий цикл бронювання
+security:
+  - accessCookie: []
+
+paths:
+  /trip-requests:
+    post:
+      tags: [Trip requests]
+      operationId: createTripRequest
+      summary: Створити структурований запит на подорож
+      description: |
+        Синхронно перетворює природномовний текст у `TripRequest` (Gemini API,
+        SRS-FUN-05/06), редагує PII (PRIV-01), виконує ANN-відбір кандидатів
+        (FUN-08, FUN-30) і зберігає знімок кандидатів. `start_point` до Gemini
+        не передається. Якщо передано `structured`, виклик LLM не виконується
+        (деградація REL-04). Ліміт: 10 запитів/хв на користувача (SEC-03).
+      security:
+        - accessCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TripRequestCreate'
+      responses:
+        '201':
+          description: Запит створено, кандидатів відібрано.
+          headers:
+            Location:
+              description: URL створеного ресурсу.
+              schema: { type: string, format: uri-reference }
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TripRequest'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /trips:
+    post:
+      tags: [Optimization jobs]
+      operationId: createOptimizationJob
+      summary: Поставити задачу побудови розкладу в чергу
+      description: |
+        Створює запис `optimization_jobs` зі статусом `PENDING` і публікує
+        `job_id` у чергу `optimization` (SRS-FUN-09). Не викликає зовнішніх API,
+        тому підпадає під PERF-03 (p95 ≤ 100 мс). Повторний запит з тим самим
+        `Idempotency-Key` повертає ту саму задачу.
+      security:
+        - accessCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TripCreate'
+      responses:
+        '202':
+          description: Задачу прийнято.
+          headers:
+            Location:
+              description: URL статусу задачі `/v1/jobs/{job_id}`.
+              required: true
+              schema: { type: string, format: uri-reference }
+            Retry-After:
+              description: Рекомендований інтервал опитування, с.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobAccepted'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /jobs/{job_id}:
+    get:
+      tags: [Optimization jobs]
+      operationId: getOptimizationJob
+      summary: Отримати статус і результат задачі оптимізації
+      description: |
+        Статуси та переходи — SRS Додаток C.1. При `SUCCESS` повертається
+        `itinerary_id`; при `INFEASIBLE` — перелік конфліктних обмежень (FUN-12).
+        Чужа задача → 404 (FUN-04).
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Поточний стан задачі.
+          headers:
+            Retry-After:
+              description: Присутній для `PENDING` і `RUNNING`.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptimizationJob'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /itineraries/{itinerary_id}:
+    get:
+      tags: [Itineraries]
+      operationId: getItinerary
+      summary: Отримати маршрут для відображення на карті
+      parameters:
+        - $ref: '#/components/parameters/ItineraryId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Маршрут.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Itinerary'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /itineraries/{itinerary_id}/confirmation:
+    put:
+      tags: [Itineraries]
+      operationId: confirmItinerary
+      summary: Підтвердити маршрут і зарезервувати всі слоти однією транзакцією
+      description: |
+        SRS-FUN-17, FUN-36, FUN-38, REL-01. Операція «все або нічого»: при
+        конфлікті будь-якого слота жодне бронювання не створюється.
+        PUT ідемпотентний за семантикою ресурсу; додатково вимагається
+        `Idempotency-Key` (24 год у межах користувача й ендпоінта).
+      security:
+        - accessCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/ItineraryId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmationRequest'
+      responses:
+        '201':
+          description: Маршрут підтверджено, бронювання створено.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Confirmation'
+        '200':
+          description: Повтор із тим самим `Idempotency-Key` і тілом — збережений результат.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Confirmation'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Конфлікт місткості слотів (`SLOT_CONFLICT`), маршрут уже підтверджено
+            (`ALREADY_CONFIRMED`), задача не в статусі `SUCCESS` (`INVALID_STATE`)
+            або паралельний запит з тим самим ключем (`IDEMPOTENCY_IN_PROGRESS`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/SlotConflictProblem'
+        '410': { $ref: '#/components/responses/Gone' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /bookings:
+    get:
+      tags: [Bookings]
+      operationId: listBookings
+      summary: Перелік власних бронювань (SRS-FUN-42)
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/BookingStatus' }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          required: false
+          description: Непрозорий курсор keyset-пагінації.
+          schema: { type: string, maxLength: 256 }
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Сторінка бронювань.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /bookings/{booking_id}/cancellation:
+    put:
+      tags: [Bookings]
+      operationId: cancelBooking
+      summary: Скасувати бронювання (SRS-FUN-18)
+      description: |
+        Дозволено до `slot.start`; для статусу `COMPLETED` — 409.
+        Повторне скасування вже скасованого бронювання повертає 200 (ідемпотентність).
+      security:
+        - accessCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Бронювання у статусі `CANCELLED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /bookings/{booking_id}/completion:
+    put:
+      tags: [Bookings]
+      operationId: completeBooking
+      summary: Підтвердити візит персоналом (SRS-FUN-19)
+      description: |
+        Лише роль `staff`, чий `venue_id` за даними БД дорівнює закладу
+        бронювання; не раніше `slot.start`.
+      security:
+        - accessCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Бронювання у статусі `COMPLETED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+components:
+  securitySchemes:
+    accessCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-access
+      description: |
+        JWT access-токен (RFC 7519), підпис ES256 (allowlist; `none` і HS* відхиляються),
+        заголовок `kid`, claims `iss`, `aud`, `sub`, `role`, `venue_id` (для `staff`),
+        `jti`, `iat`, `exp`; строк дії 15 хв. Cookie `HttpOnly; Secure; SameSite=Strict`.
+        Видається `POST /v1/auth/login`, оновлюється `POST /v1/auth/refresh`
+        (контракт Auth Service поза межами цього файлу).
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Double-submit CSRF-токен; обов'язковий для POST, PUT, PATCH, DELETE.
+
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ItineraryId:
+      name: itinerary_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BookingId:
+      name: booking_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID v4; область дії (user_id, endpoint), TTL 24 год (REL-01).
+      schema: { type: string, format: uuid }
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Якщо відсутній, генерується API Gateway і повертається у відповіді.
+      schema: { type: string, format: uuid }
+
+  headers:
+    XCorrelationId:
+      description: Ідентифікатор кореляції запиту.
+      schema: { type: string, format: uuid }
+    RetryAfter:
+      description: Кількість секунд до повторної спроби.
+      schema: { type: integer, minimum: 1 }
+
+  responses:
+    BadRequest:
+      description: Синтаксично некоректний запит (JSON, формат UUID).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Відсутній, прострочений або недійсний access-токен.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Роль не відповідає матриці «роль × ендпоінт» або не пройдено CSRF-перевірку.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Об'єкт не існує або не належить користувачу (BOLA, FUN-04).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Недопустимий перехід стану (Додаток C) або конфлікт ключа ідемпотентності.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Gone:
+      description: Минув TTL розкладу (`valid_until`, FUN-36).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnprocessableEntity:
+      description: |
+        Порушення схеми або бізнес-правил: відсутні обов'язкові поля TripRequest
+        (`MISSING_FIELDS`), повтор `Idempotency-Key` з іншим тілом
+        (`IDEMPOTENCY_KEY_REUSED`), невалідні значення полів (`VALIDATION_ERROR`),
+        відсутні кандидати (`NO_CANDIDATES`).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ValidationProblem' }
+    TooManyRequests:
+      description: Перевищено ліміт частоти (SEC-03) або кількість активних задач/бронювань (SEC-07).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    BadGateway:
+      description: Gemini API повернув відповідь, що не відповідає схемі, після 2 повторів (`LLM_INVALID_RESPONSE`, FUN-06).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServiceUnavailable:
+      description: |
+        Брокер недоступний (`BROKER_UNAVAILABLE`, FUN-09), черга переповнена
+        (`QUEUE_FULL`, REL-06) або Redis rate limit недоступний для LLM-ендпоінтів
+        (`RATE_LIMIT_UNAVAILABLE`, fail-closed).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Money:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          description: Десятковий рядок, відповідає `numeric(12,2)`.
+          pattern: '^(0|[1-9][0-9]{0,9})(\.[0-9]{1,2})?$'
+          examples: ['1500.00']
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          examples: [UAH]
+    GeoPoint:
+      type: object
+      additionalProperties: false
+      required: [lat, lon]
+      properties:
+        lat: { type: number, format: double, minimum: -90, maximum: 90 }
+        lon: { type: number, format: double, minimum: -180, maximum: 180 }
+    VenueCategory:
+      type: string
+      enum: [HOTEL, RESTAURANT, CAFE, MUSEUM, SHOP, PARK, EVENT, TOUR]
+    Pace:
+      type: string
+      enum: [RELAXED, NORMAL, INTENSIVE]
+    TravelProfile:
+      type: string
+      enum: [WALKING, DRIVING]
+      default: WALKING
+    JobStatus:
+      type: string
+      enum: [PENDING, RUNNING, SUCCESS, INFEASIBLE, TIMEOUT, FAILED]
+    SolverStatus:
+      type: string
+      enum: [OPTIMAL, FEASIBLE]
+    BookingStatus:
+      type: string
+      enum: [CONFIRMED, COMPLETED, CANCELLED]
+    ConstraintType:
+      type: string
+      enum: [OPENING_HOURS, VISIT_DURATION, TRAVEL_TIME, BUDGET, DAY_WINDOW, MAX_STOPS_PER_DAY, SLOT_CAPACITY, VISIT_ONCE]
+
+    TripRequestStructured:
+      type: object
+      additionalProperties: false
+      required: [date_from, date_to, budget, party_size]
+      properties:
+        date_from: { type: string, format: date }
+        date_to: { type: string, format: date, description: 'date_to ≥ date_from; не більше 7 днів.' }
+        budget: { $ref: '#/components/schemas/Money' }
+        categories:
+          type: array
+          items: { $ref: '#/components/schemas/VenueCategory' }
+          uniqueItems: true
+          maxItems: 8
+        pace: { $ref: '#/components/schemas/Pace' }
+        party_size: { type: integer, minimum: 1, maximum: 20 }
+    TripRequestCreate:
+      type: object
+      additionalProperties: false
+      required: [start_point]
+      description: Рівно одне з полів `text` або `structured`.
+      oneOf:
+        - required: [text]
+        - required: [structured]
+      properties:
+        text:
+          type: string
+          minLength: 3
+          maxLength: 1000
+          description: Природномовний запит (`uk` або `en`).
+        language:
+          type: string
+          enum: [uk, en]
+        structured:
+          $ref: '#/components/schemas/TripRequestStructured'
+        start_point:
+          $ref: '#/components/schemas/GeoPoint'
+        radius_km:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 50
+          default: 10
+        travel_profile:
+          $ref: '#/components/schemas/TravelProfile'
+    TripRequest:
+      type: object
+      required: [id, date_from, date_to, budget, categories, pace, party_size, start_point, travel_profile, candidates_count, candidates_degraded, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        date_from: { type: string, format: date }
+        date_to: { type: string, format: date }
+        budget: { $ref: '#/components/schemas/Money' }
+        categories:
+          type: array
+          items: { $ref: '#/components/schemas/VenueCategory' }
+        pace: { $ref: '#/components/schemas/Pace' }
+        party_size: { type: integer, minimum: 1, maximum: 20 }
+        start_point: { $ref: '#/components/schemas/GeoPoint' }
+        travel_profile: { $ref: '#/components/schemas/TravelProfile' }
+        candidates_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: min(50, N), FUN-08.
+        candidates_degraded:
+          type: boolean
+          description: true, якщо замість embeddings використано повнотекстовий пошук (REL-04).
+        created_at: { type: string, format: date-time }
+
+    TripCreate:
+      type: object
+      additionalProperties: false
+      required: [trip_request_id]
+      properties:
+        trip_request_id: { $ref: '#/components/schemas/Uuid' }
+    JobAccepted:
+      type: object
+      required: [job_id, status, status_url]
+      properties:
+        job_id: { $ref: '#/components/schemas/Uuid' }
+        status:
+          const: PENDING
+        status_url: { type: string, format: uri-reference }
+
+    Conflict:
+      type: object
+      required: [constraint_id, type, entities]
+      properties:
+        constraint_id: { type: string, maxLength: 64 }
+        type: { $ref: '#/components/schemas/ConstraintType' }
+        entities:
+          type: array
+          items: { $ref: '#/components/schemas/Uuid' }
+    OptimizationJob:
+      type: object
+      required: [job_id, status, degraded, created_at]
+      properties:
+        job_id: { $ref: '#/components/schemas/Uuid' }
+        trip_request_id: { $ref: '#/components/schemas/Uuid' }
+        status: { $ref: '#/components/schemas/JobStatus' }
+        phase1_status: { $ref: '#/components/schemas/SolverStatus' }
+        phase2_status: { $ref: '#/components/schemas/SolverStatus' }
+        itinerary_id:
+          $ref: '#/components/schemas/Uuid'
+          description: Присутній лише при status = SUCCESS.
+        conflicts:
+          type: array
+          description: Присутній лише при status = INFEASIBLE.
+          items: { $ref: '#/components/schemas/Conflict' }
+        degraded: { type: boolean }
+        error_code:
+          type: string
+          maxLength: 64
+          description: Присутній при FAILED або TIMEOUT.
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    ItineraryStop:
+      type: object
+      required: [stop_id, day_index, seq, venue_id, venue_name, location, arrive_at, depart_at, travel_from_prev_s]
+      properties:
+        stop_id: { $ref: '#/components/schemas/Uuid' }
+        day_index: { type: integer, minimum: 0, maximum: 6 }
+        seq: { type: integer, minimum: 0 }
+        venue_id: { $ref: '#/components/schemas/Uuid' }
+        venue_name: { type: string, maxLength: 200 }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        slot_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        arrive_at: { type: string, format: date-time }
+        depart_at: { type: string, format: date-time }
+        travel_from_prev_s: { type: integer, minimum: 0 }
+    Itinerary:
+      type: object
+      required: [id, job_id, valid_until, total_price, stops]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        job_id: { $ref: '#/components/schemas/Uuid' }
+        valid_until: { type: string, format: date-time }
+        confirmed_at:
+          oneOf:
+            - { type: string, format: date-time }
+            - type: 'null'
+        total_price: { $ref: '#/components/schemas/Money' }
+        stops:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: '#/components/schemas/ItineraryStop' }
+
+    ConfirmationRequest:
+      type: object
+      additionalProperties: false
+      required: [accept_terms]
+      properties:
+        accept_terms:
+          const: true
+    Booking:
+      type: object
+      required: [id, slot_id, venue_id, party_size, status, starts_at, ends_at, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        slot_id: { $ref: '#/components/schemas/Uuid' }
+        venue_id: { $ref: '#/components/schemas/Uuid' }
+        itinerary_stop_id: { $ref: '#/components/schemas/Uuid' }
+        party_size: { type: integer, minimum: 1, maximum: 20 }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        cancelled_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+    Confirmation:
+      type: object
+      required: [itinerary_id, confirmed_at, bookings]
+      properties:
+        itinerary_id: { $ref: '#/components/schemas/Uuid' }
+        confirmed_at: { type: string, format: date-time }
+        bookings:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/Booking' }
+    BookingPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Booking' }
+        next_cursor:
+          oneOf:
+            - { type: string, maxLength: 256 }
+            - type: 'null'
+
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, default: about:blank }
+        title: { type: string, maxLength: 200 }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string, maxLength: 1000 }
+        instance: { type: string, format: uri-reference }
+        code:
+          type: string
+          maxLength: 64
+          examples: [JOB_NOT_FOUND, INVALID_STATE_TRANSITION, RATE_LIMITED]
+        correlation_id: { $ref: '#/components/schemas/Uuid' }
+    ValidationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+                required: [field, reason]
+                properties:
+                  field: { type: string, description: 'JSON Pointer, напр. /structured/date_to' }
+                  reason: { type: string }
+            missing_fields:
+              type: array
+              items: { type: string }
+    SlotConflictProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            conflicting_slot_ids:
+              type: array
+              items: { $ref: '#/components/schemas/Uuid' }
